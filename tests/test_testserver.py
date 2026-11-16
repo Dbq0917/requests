@@ -1,3 +1,5 @@
+import hashlib
+import re
 import socket
 import threading
 import time
@@ -5,7 +7,7 @@ import time
 import pytest
 
 import requests
-from tests.testserver.server import Server
+from tests.testserver.server import Server, consume_socket_content
 
 
 class TestTestServer:
@@ -163,3 +165,105 @@ class TestTestServer:
 
         # if the server thread fails to finish, the test suite will hang
         # and get killed by the jenkins timeout.
+
+
+class TestDigestAuthAlgorithmList:
+    """Digest auth against servers that send the algorithm challenge
+    field as a comma-separated list (RFC 7616 allows a list of
+    algorithms, and some legacy servers format it with whitespace
+    and/or inconsistent casing)."""
+
+    REALM = "testrealm"
+    NONCE = "dcd98b7102dd2f0e8b11d0f600bfb0c093"
+    USERNAME = "user"
+    PASSWORD = "pass"
+
+    HASHES = {
+        "MD5": hashlib.md5,
+        "MD5-SESS": hashlib.md5,
+        "SHA": hashlib.sha1,
+        "SHA-256": hashlib.sha256,
+        "SHA-512": hashlib.sha512,
+    }
+
+    def _hash(self, algorithm, value):
+        return self.HASHES[algorithm](
+            value.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
+
+    def _is_valid_digest(self, request_text):
+        match = re.search(
+            r"^Authorization: Digest (.*)$", request_text, re.IGNORECASE | re.MULTILINE
+        )
+        if not match:
+            return False
+        values = dict(re.findall(r'(\w+)="?([^",]+)"?', match.group(1)))
+        algorithm = values.get("algorithm", "MD5").upper()
+        if algorithm not in self.HASHES:
+            return False
+
+        request_line = request_text.splitlines()[0]
+        method, uri, _ = request_line.split(" ", 2)
+
+        ha1 = self._hash(algorithm, f"{self.USERNAME}:{self.REALM}:{self.PASSWORD}")
+        if algorithm == "MD5-SESS":
+            ha1 = self._hash(algorithm, f"{ha1}:{self.NONCE}:{values['cnonce']}")
+        ha2 = self._hash(algorithm, f"{method}:{uri}")
+        expected = self._hash(
+            algorithm,
+            f"{ha1}:{self.NONCE}:{values['nc']}:{values['cnonce']}:auth:{ha2}",
+        )
+        return expected == values["response"]
+
+    def _digest_server(self, algorithm_value, requests_to_handle=2):
+        def handler(sock):
+            request_text = consume_socket_content(sock).decode("utf-8")
+            if self._is_valid_digest(request_text):
+                response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+            else:
+                response = (
+                    "HTTP/1.1 401 Unauthorized\r\n"
+                    "Content-Length: 0\r\n"
+                    f'WWW-Authenticate: Digest realm="{self.REALM}", nonce="{self.NONCE}", '
+                    f'qop="auth", algorithm="{algorithm_value}"\r\n'
+                    "\r\n"
+                )
+            sock.sendall(response.encode("utf-8"))
+            return request_text
+
+        return Server(handler, requests_to_handle=requests_to_handle)
+
+    @pytest.mark.parametrize(
+        "algorithm_value",
+        (
+            "MD5,SHA-256",  # comma-separated, no whitespace
+            "MD5, SHA-256",  # comma-separated, with whitespace
+            "mD5, sHa-256",  # mixed case
+            "UNKNOWN, MD5",  # unknown values are skipped
+        ),
+    )
+    def test_digest_auth_algorithm_list(self, algorithm_value):
+        """digest auth succeeds for each algorithm list formatting"""
+        server = self._digest_server(algorithm_value)
+        with server as (host, port):
+            r = requests.get(
+                f"http://{host}:{port}/",
+                auth=requests.auth.HTTPDigestAuth(self.USERNAME, self.PASSWORD),
+            )
+            assert r.status_code == 200
+
+        # exactly one 401 retry: the initial request plus one
+        # authenticated retry, no more (replay protection unchanged)
+        assert len(server.handler_results) == 2
+
+    def test_digest_auth_unsupported_algorithm_names_field(self):
+        """an unsupported algorithm challenge fails with an error that
+        identifies the 'algorithm' field"""
+        server = self._digest_server("FOO, BAR", requests_to_handle=1)
+        with server as (host, port):
+            with pytest.raises(ValueError) as excinfo:
+                requests.get(
+                    f"http://{host}:{port}/",
+                    auth=requests.auth.HTTPDigestAuth(self.USERNAME, self.PASSWORD),
+                )
+            assert "algorithm" in str(excinfo.value)

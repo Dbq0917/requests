@@ -124,6 +124,9 @@ class HTTPProxyAuth(HTTPBasicAuth):
 class HTTPDigestAuth(AuthBase):
     """Attaches HTTP Digest Authentication to the given Request object."""
 
+    #: Digest algorithms this implementation supports, uppercase.
+    _SUPPORTED_ALGORITHMS = frozenset({"MD5", "MD5-SESS", "SHA", "SHA-256", "SHA-512"})
+
     username: bytes | str
     password: bytes | str
     _thread_local: threading.local
@@ -169,7 +172,20 @@ class HTTPDigestAuth(AuthBase):
         if algorithm is None:
             _algorithm = "MD5"
         else:
-            _algorithm = algorithm.upper()
+            # Some servers send a comma-separated list of algorithms
+            # (e.g. "MD5, SHA-256"); pick the first one we support.
+            _algorithm = None
+            for offered_algorithm in algorithm.split(","):
+                offered_algorithm = offered_algorithm.strip()
+                if offered_algorithm.upper() in self._SUPPORTED_ALGORITHMS:
+                    _algorithm = offered_algorithm.upper()
+                    algorithm = offered_algorithm
+                    break
+            if _algorithm is None:
+                raise ValueError(
+                    "None of the algorithms in the 'algorithm' field of the "
+                    f"digest challenge are supported: {algorithm!r}"
+                )
         # lambdas assume digest modules are imported at the top level
         if _algorithm == "MD5" or _algorithm == "MD5-SESS":
 

@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Final, cast, overload
 from ._internal_utils import to_native_string
 from .compat import basestring, str, urlparse
 from .cookies import extract_cookies_to_jar
-from .utils import parse_dict_header
+from .utils import parse_dict_header, parse_list_header, unquote_header_value
 
 if TYPE_CHECKING:
     from http.cookiejar import CookieJar
@@ -29,6 +29,37 @@ if TYPE_CHECKING:
 
 CONTENT_TYPE_FORM_URLENCODED: Final = "application/x-www-form-urlencoded"
 CONTENT_TYPE_MULTI_PART: Final = "multipart/form-data"
+
+
+def _parse_digest_challenge(value: str) -> dict[str, str | None]:
+    """Parse a Digest challenge, including unquoted qop option lists."""
+    challenge = parse_dict_header(value)
+    qop_values: list[str] = []
+    in_qop = False
+
+    for item in parse_list_header(value):
+        if not in_qop:
+            if "=" not in item:
+                continue
+            name, qop_value = item.split("=", 1)
+            if name.strip().lower() != "qop":
+                continue
+            in_qop = True
+            qop_value = qop_value.strip()
+            if qop_value[:1] == qop_value[-1:] == '"':
+                qop_values.append(unquote_header_value(qop_value[1:-1]))
+                break
+            qop_values.append(qop_value)
+            continue
+
+        if "=" in item:
+            break
+        qop_values.append(item.strip())
+
+    if in_qop:
+        challenge["qop"] = ",".join(qop_values)
+
+    return challenge
 
 
 def _basic_auth_str(username: bytes | str, password: bytes | str) -> str:
@@ -124,6 +155,8 @@ class HTTPProxyAuth(HTTPBasicAuth):
 class HTTPDigestAuth(AuthBase):
     """Attaches HTTP Digest Authentication to the given Request object."""
 
+    _SUPPORTED_QOP: Final = frozenset({"auth"})
+
     username: bytes | str
     password: bytes | str
     _thread_local: threading.local
@@ -161,7 +194,7 @@ class HTTPDigestAuth(AuthBase):
 
         realm = self._thread_local.chal["realm"]
         nonce = self._thread_local.chal["nonce"]
-        qop = self._thread_local.chal.get("qop")
+        qop = self._select_qop(self._thread_local.chal.get("qop"))
         algorithm = self._thread_local.chal.get("algorithm")
         opaque = self._thread_local.chal.get("opaque")
         hash_utf8 = None
@@ -240,7 +273,7 @@ class HTTPDigestAuth(AuthBase):
 
         if not qop:
             respdig = KD(HA1, f"{nonce}:{HA2}")
-        elif qop == "auth" or "auth" in qop.split(","):
+        elif qop == "auth":
             noncebit = f"{nonce}:{ncvalue}:{cnonce}:auth:{HA2}"
             respdig = KD(HA1, noncebit)
         else:
@@ -264,6 +297,23 @@ class HTTPDigestAuth(AuthBase):
             base += f', qop="auth", nc={ncvalue}, cnonce="{cnonce}"'
 
         return f"Digest {base}"
+
+    def _select_qop(self, qop: str | None) -> str | None:
+        if not qop:
+            return None
+
+        values = [value.strip().lower() for value in qop.split(",")]
+        for value in values:
+            if value in self._SUPPORTED_QOP:
+                return value
+
+        if not any(values):
+            return None
+
+        raise ValueError(
+            "No supported quality of protection value in the Digest "
+            f"challenge 'qop' field: {qop!r}"
+        )
 
     def handle_redirect(self, r: Response, **kwargs: Any) -> None:
         """Reset num_401_calls counter on redirects."""
@@ -293,7 +343,9 @@ class HTTPDigestAuth(AuthBase):
         if "digest" in s_auth.lower() and self._thread_local.num_401_calls < 2:
             self._thread_local.num_401_calls += 1
             pat = re.compile(r"digest ", flags=re.IGNORECASE)
-            self._thread_local.chal = parse_dict_header(pat.sub("", s_auth, count=1))
+            self._thread_local.chal = _parse_digest_challenge(
+                pat.sub("", s_auth, count=1)
+            )
 
             # Consume content and release the original connection
             # to allow our new request to reuse the same one.

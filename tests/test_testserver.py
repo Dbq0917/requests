@@ -1,3 +1,5 @@
+import hashlib
+import re
 import socket
 import threading
 import time
@@ -5,7 +7,7 @@ import time
 import pytest
 
 import requests
-from tests.testserver.server import Server
+from tests.testserver.server import Server, consume_socket_content
 
 
 class TestTestServer:
@@ -163,3 +165,114 @@ class TestTestServer:
 
         # if the server thread fails to finish, the test suite will hang
         # and get killed by the jenkins timeout.
+
+
+class TestDigestAuthQopList:
+    """Digest auth against servers that format qop as a list."""
+
+    REALM = "testrealm"
+    NONCE = "dcd98b7102dd2f0e8b11d0f600bfb0c093"
+    USERNAME = "user"
+    PASSWORD = "pass"
+
+    def _is_valid_digest(self, request_text):
+        match = re.search(
+            r"^Authorization: Digest (.*)$", request_text, re.IGNORECASE | re.MULTILINE
+        )
+        if not match:
+            return False
+
+        values = {
+            name.lower(): quoted or unquoted
+            for name, quoted, unquoted in re.findall(
+                r'(\w+)=(?:"([^"]*)"|([^,\s]+))', match.group(1)
+            )
+        }
+        required = {
+            "username",
+            "realm",
+            "nonce",
+            "uri",
+            "response",
+            "qop",
+            "nc",
+            "cnonce",
+        }
+        if not required.issubset(values) or values["qop"] != "auth":
+            return False
+
+        method, uri, _ = request_text.splitlines()[0].split(" ", 2)
+        if uri != values["uri"]:
+            return False
+
+        def md5(value):
+            return hashlib.md5(value.encode("utf-8"), usedforsecurity=False).hexdigest()
+
+        ha1 = md5(f"{self.USERNAME}:{self.REALM}:{self.PASSWORD}")
+        ha2 = md5(f"{method}:{uri}")
+        expected = md5(
+            f"{ha1}:{self.NONCE}:{values['nc']}:{values['cnonce']}:auth:{ha2}"
+        )
+        return expected == values["response"]
+
+    def _digest_server(self, qop_directive, requests_to_handle=2):
+        def handler(sock):
+            request_text = consume_socket_content(sock).decode("latin-1")
+            if self._is_valid_digest(request_text):
+                response = (
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            else:
+                response = (
+                    "HTTP/1.1 401 Unauthorized\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n"
+                    f'WWW-Authenticate: Digest realm="{self.REALM}", '
+                    f'nonce="{self.NONCE}", {qop_directive}, algorithm=MD5\r\n'
+                    "\r\n"
+                )
+            sock.sendall(response.encode("latin-1"))
+            return request_text
+
+        return Server(handler, requests_to_handle=requests_to_handle)
+
+    @pytest.mark.parametrize(
+        "qop_directive",
+        (
+            'qop="auth"',
+            'qop="auth,auth-int"',
+            'qop="auth, auth-int"',
+            'qop="AUTH, AUTH-INT"',
+            'qop="UNKNOWN, auth"',
+            "qop=auth, auth-int",
+            "qop=auth-int, auth",
+        ),
+    )
+    def test_digest_auth_qop_list(self, qop_directive):
+        server = self._digest_server(qop_directive)
+        with server as (host, port):
+            response = requests.get(
+                f"http://{host}:{port}/",
+                auth=requests.auth.HTTPDigestAuth(self.USERNAME, self.PASSWORD),
+            )
+            assert response.status_code == 200
+            assert 'qop="auth"' in response.request.headers["Authorization"]
+
+        assert len(server.handler_results) == 2
+
+    @pytest.mark.parametrize(
+        "qop_directive",
+        (
+            'qop="auth-int"',
+            'qop="UNKNOWN, OTHER"',
+            "qop=auth-int, UNKNOWN",
+        ),
+    )
+    def test_unsupported_qop_names_field(self, qop_directive):
+        server = self._digest_server(qop_directive, requests_to_handle=1)
+        with server as (host, port):
+            with pytest.raises(ValueError, match="qop"):
+                requests.get(
+                    f"http://{host}:{port}/",
+                    auth=requests.auth.HTTPDigestAuth(self.USERNAME, self.PASSWORD),
+                )
